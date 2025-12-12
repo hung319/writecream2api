@@ -1,7 +1,7 @@
 /**
  * =================================================================================
  * Project: writecream-2api (Bun Edition)
- * Version: 1.0.0-bun
+ * Version: 1.1.0-bun (Stream Aggregation Support)
  * Description: High-performance OpenAI-compatible proxy for Writecream.
  * Runtime: Bun v1.0+
  * =================================================================================
@@ -35,17 +35,17 @@ Bun.serve({
       return handleApi(request);
     }
 
-    // 3. 404 Handler (No UI anymore)
+    // 3. 404 Handler
     return createErrorResponse(`Path not found: ${url.pathname}`, 404, 'not_found');
   },
 });
 
 // --- [API Logic] ---
 
-async function handleApi(request) {
+async function handleApi(request: Request) {
   // Authentication Middleware
   const authHeader = request.headers.get('Authorization');
-  // Allow logic: If env key is "1", allow anonymous (per original logic), otherwise check Bearer
+  // Logic: If env key is "1", allow anonymous. Otherwise check Bearer token.
   if (CONFIG.API_MASTER_KEY !== "1") {
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return createErrorResponse('Unauthorized: Missing Bearer Token.', 401, 'unauthorized');
@@ -84,7 +84,7 @@ function handleModelsRequest() {
   });
 }
 
-async function handleChatCompletions(request, requestId) {
+async function handleChatCompletions(request: Request, requestId: string) {
   try {
     const requestData = await request.json();
     
@@ -113,19 +113,38 @@ async function handleChatCompletions(request, requestId) {
       return createErrorResponse(`Upstream error: ${upstreamResponse.status}`, upstreamResponse.status, 'upstream_error');
     }
 
-    const responseData = await upstreamResponse.json();
-    
-    // Validate Upstream Response
-    if (!responseData.success || !responseData.data || !responseData.data.response_content) {
-       console.error("Invalid upstream response:", responseData);
-       return createErrorResponse('Invalid response structure from upstream', 502, 'bad_gateway');
+    // --- Data Processing Logic ---
+    const rawResponseBody = await upstreamResponse.text();
+    let fullContent = "";
+
+    try {
+        // Attempt 1: Parse as standard JSON (Old format or clean response)
+        const jsonData = JSON.parse(rawResponseBody);
+        if (jsonData.data && jsonData.data.response_content) {
+            fullContent = jsonData.data.response_content;
+        } else if (jsonData.choices) {
+             // Standard OpenAI-like JSON (Non-stream)
+             fullContent = jsonData.choices[0].message.content;
+        }
+    } catch (e) {
+        // Attempt 2: If JSON parse fails, assume it's the Stream format (SSE lines)
+        // This handles inputs like: {"id":...}\n data: {"id"...}
+        fullContent = accumulateStreamData(rawResponseBody);
     }
 
-    const fullContent = responseData.data.response_content;
+    // Final check if content was extracted
+    if (!fullContent) {
+        console.error("Failed to extract content from upstream response. Raw preview:", rawResponseBody.substring(0, 200));
+        return createErrorResponse('Upstream response format not recognized or empty', 502, 'bad_gateway');
+    }
+
     const model = requestData.model || CONFIG.DEFAULT_MODEL;
 
-    // Handle Streaming (Pseudo-Stream)
+    // --- Response Construction ---
+
+    // Case 1: Client wants Stream (stream: true)
     if (requestData.stream !== false) {
+      // Re-stream the aggregated content (Pseudo-stream)
       const stream = createPseudoStream(fullContent, requestId, model);
       return new Response(stream, {
         headers: corsHeaders({
@@ -136,7 +155,7 @@ async function handleChatCompletions(request, requestId) {
         }),
       });
     } else {
-      // Handle Normal Response
+      // Case 2: Client wants JSON (stream: false)
       const openAIResponse = {
         id: requestId,
         object: "chat.completion",
@@ -157,16 +176,52 @@ async function handleChatCompletions(request, requestId) {
       });
     }
 
-  } catch (e) {
+  } catch (e: any) {
     console.error('Exception in chat completions:', e);
     return createErrorResponse(`Internal Server Error: ${e.message}`, 500, 'internal_server_error');
   }
 }
 
 /**
+ * Parses raw SSE/Stream text (mixed with potential JSON lines) and aggregates content.
+ * Handles formats: 
+ * 1. {"id":...} 
+ * 2. data: {"id":...}
+ */
+function accumulateStreamData(rawData: string): string {
+  const lines = rawData.split('\n');
+  let fullText = "";
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    
+    // Skip empty lines or DONE signal
+    if (!trimmed || trimmed === 'data: [DONE]') continue;
+
+    let jsonStr = trimmed;
+    // Remove 'data: ' prefix if present
+    if (trimmed.startsWith('data: ')) {
+        jsonStr = trimmed.slice(6);
+    }
+
+    try {
+        const json = JSON.parse(jsonStr);
+        // Extract content from delta structure
+        if (json.choices && json.choices[0] && json.choices[0].delta && json.choices[0].delta.content) {
+            fullText += json.choices[0].delta.content;
+        }
+    } catch (e) {
+        // Ignore parsing errors for individual lines (best effort)
+    }
+  }
+  
+  return fullText;
+}
+
+/**
  * Converts a static text response into an OpenAI-compatible SSE stream with typewriter effect.
  */
-function createPseudoStream(text, requestId, model) {
+function createPseudoStream(text: string, requestId: string, model: string) {
   const encoder = new TextEncoder();
   // Split by spaces to simulate token generation, preserving structure
   let words = text.split(/(\s+)/); 
@@ -188,8 +243,8 @@ function createPseudoStream(text, requestId, model) {
           };
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
         }
-        // "Typewriter" delay simulation (25ms)
-        await Bun.sleep(25); 
+        // "Typewriter" delay simulation (20ms for faster response)
+        await Bun.sleep(20); 
       }
 
       // Final closing chunk
@@ -213,7 +268,7 @@ function createPseudoStream(text, requestId, model) {
 
 // --- [Helpers] ---
 
-function createErrorResponse(message, status, code) {
+function createErrorResponse(message: string, status: number, code: string) {
   return new Response(JSON.stringify({
     error: { message, type: 'api_error', code }
   }), {
@@ -229,7 +284,7 @@ function handleCorsPreflight() {
   });
 }
 
-function corsHeaders(headers = {}) {
+function corsHeaders(headers: any = {}) {
   return {
     ...headers,
     'Access-Control-Allow-Origin': '*',
